@@ -12,7 +12,10 @@ pub mod bindings {
 }
 
 use bindings::Windows::Win32::{
-    Foundation::PWSTR, System::Com::CoInitialize, UI::Shell::PathCchCanonicalizeEx,
+    Foundation::PWSTR,
+    System::Com::CoInitialize,
+    UI::Shell::PathCchCanonicalizeEx,
+    Storage::FileSystem::{MoveFileExW,MOVE_FILE_FLAGS},
 };
 
 /*
@@ -22,6 +25,7 @@ use bindings::Windows::Win32::{
 
 lazy_static! {
     static ref INIT: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    static ref WIN_ESCAPED_CHAR: Regex = Regex::new(r#"\u{005E}(.)"#).unwrap();
     static ref ROOTED_MING_W64_COMPAT: Regex = Regex::new(r#"^/([a-zA-Z])/(.*)$"#).unwrap();
     static ref ROOTED_TILDE_COMPAT: Regex = Regex::new(r#"^(~)(.*)$"#).unwrap();
     static ref NORMALIZE_SLASH: Regex = Regex::new(r#"([\u{005C}\u{002F}]{1,})"#).unwrap();
@@ -68,6 +72,28 @@ impl<'a> ToCow<'a> for &'a Cow<'_, str> {
     fn to_cow(self) -> Cow<'a, str> {
         Cow::Borrowed(self.as_ref())
     }
+}
+
+fn win_escape_char<'a,T>(arg: T) -> Result<Cow<'a,str>,Box<dyn std::error::Error>>
+where
+    T: ToCow<'a>,
+{
+    let cow = <T as ToCow>::to_cow(arg);
+    if WIN_ESCAPED_CHAR.is_match(cow.as_ref()) {
+        Ok(WIN_ESCAPED_CHAR.replace_all(cow.as_ref(), "$1")
+            .to_string()
+            .to_cow())
+    } else {
+        Ok(cow)
+    }
+}
+
+#[test]
+fn test_win_escape_char() {
+    assert_eq!(
+        win_escape_char(r#"F:\^^Users^\Valarauca"#).unwrap(),
+        r#"F:\^Users\Valarauca"#
+    );
 }
 
 fn fix_root<'a, T>(arg: T) -> Result<Cow<'a, str>, Box<dyn std::error::Error>>
@@ -258,7 +284,9 @@ fn test_path_cch_canonicalize_ex() {
     );
 }
 
-/// The only public method. This canonicalizes a path, if the path in question exists or not
+/// This canonicalizes a path, if the path in question exists or not
+///
+/// Will handle some -oddities- of cygwin, mingw, and windows shell
 pub fn canonicalize(path: &str) -> Result<String, Box<dyn std::error::Error>> {
     let a = fix_root(path)?;
     let b = fix_tilde(a)?;
@@ -275,4 +303,41 @@ fn assert_matches() {
     );
     assert_eq!(canonicalize("/f/Downloads/").unwrap(), r#"F:\Downloads\"#);
     assert_eq!(canonicalize("/f/Downloads/../").unwrap(), r#"F:\"#);
+}
+
+/// moves file
+fn priv_move_file<'a,A,B>(
+    src: A,
+    dst: B,
+    overwrite_okay: bool) -> Result<(),Box<dyn std::error::Error>>
+where
+    A: ToCow<'a>,
+    B: ToCow<'a>,
+{
+    co_initialize()?;
+
+    let src_value = <A as ToCow>::to_cow(src);
+    let dst_value = <B as ToCow>::to_cow(dst);
+
+    // see: https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexa
+    let mut flags = 0u32;
+    if overwrite_okay {
+        flags += 1u32;
+    }
+    // ensure copy occurs before flushing
+    flags += 0u32;
+    // allow for copy + delete when needed
+    flags += 2u32;
+    unsafe {
+        MoveFileExW(
+            src_value.as_ref(),
+            dst_value.as_ref(),
+            MOVE_FILE_FLAGS(flags)).ok()?;
+    }
+    Ok(())
+}
+
+
+pub fn move_file(src: &str, dst: &str, overwrite: bool) -> Result<(),Box<dyn std::error::Error>> {
+    priv_move_file(src, dst, overwrite)
 }
